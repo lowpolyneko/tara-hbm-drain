@@ -11,8 +11,12 @@
 #define BLOCK_PAGES (1UL << PAGE_ORDER) /* 8192                          */
 #define BLOCK_BYTES (BLOCK_PAGES << PAGE_SHIFT)
 
-static const int gpu_node[] = {4, 12, 20, 28};
 #define NGPU ((int)(sizeof gpu_node / sizeof gpu_node[0]))
+static const int gpu_node[] = {4, 12, 20, 28};
+
+struct pcp {
+  unsigned long cpu, total, free;
+};
 
 static void pin(int cpu) {
   struct bitmask *m = numa_allocate_cpumask();
@@ -30,21 +34,19 @@ static void pin(int cpu) {
  * "pagesets" block of "cpu:" lines each followed by "count:", "high:" and
  * "batch:" (pcp->count, pcp->high, pcp->batch).
  *
- * "pages free" is summed over every zone of the node. "count" is taken only
- * from the node's Movable zone (the GPU's HBM).
- *
- * want >= 0 returns that one CPU's count, want < 0 the node's parked total.
- * *freep is the node's free pages either way.
+ * "free" is summed over every zone of the node, "total" over every CPU of the
+ * node's Movable zone (the GPU's HBM), and "cpu" is that CPU's own count (cpu
+ * < 0 leaves it 0).
  */
-static unsigned long pcp_counts(int node, int want, unsigned long *freep) {
+static struct pcp pcp_counts(int node, int cpu) {
+  struct pcp r = {0, 0, 0};
   char line[256], zone[32];
   FILE *fp = fopen("/proc/zoneinfo", "r");
-  int cur = 0, cpu = -1, at_node = 0;
-  unsigned long total = 0, got = 0, free_pages = 0;
+  int cur = 0, line_cpu = -1, at_node = 0;
 
   if (fp == NULL) {
     fprintf(stderr, "/proc/zoneinfo: %s\n", strerror(errno));
-    return 0;
+    return r;
   }
   while (fgets(line, sizeof line, fp) != NULL) {
     int n;
@@ -53,28 +55,24 @@ static unsigned long pcp_counts(int node, int want, unsigned long *freep) {
     if (sscanf(line, "Node %d, zone %31s", &n, zone) == 2) {
       at_node = (n == node);
       cur = (at_node && strcmp(zone, "Movable") == 0);
-      cpu = -1;
       continue;
     }
     if (at_node && sscanf(line, " pages free %lu", &v) == 1) {
-      free_pages += v;
+      r.free += v;
       continue;
     }
     if (!cur)
       continue;
     if (sscanf(line, " cpu: %d", &n) == 1) {
-      cpu = n;
-    } else if (cpu >= 0 && sscanf(line, " count: %lu", &v) == 1) {
-      if (cpu == want) {
-        got = v;
-        break;
-      }
-      total += v;
+      line_cpu = n;
+    } else if (line_cpu >= 0 && sscanf(line, " count: %lu", &v) == 1) {
+      if (line_cpu == cpu)
+        r.cpu = v;
+      r.total += v;
     }
   }
   fclose(fp);
-  *freep = free_pages;
-  return want >= 0 ? got : total;
+  return r;
 }
 
 /*
@@ -124,20 +122,20 @@ static unsigned long drain_node(int node) {
   int cpu, n = numa_num_configured_cpus();
 
   for (cpu = 0; cpu < n; cpu++) {
-    unsigned long v, before, after, now;
+    struct pcp before, after;
     void *p;
 
-    v = pcp_counts(node, cpu, &before);
-    if (v < BLOCK_PAGES)
+    before = pcp_counts(node, cpu);
+    if (before.cpu < BLOCK_PAGES)
       continue; /* not a whole pageblock */
     pin(cpu);
     p = map_block(node);
     if (p != NULL) {
       munmap(p, BLOCK_BYTES);
-      after = pcp_counts(node, cpu, &now);
+      after = pcp_counts(node, cpu);
       printf("  node %d cpu %3d  %lu -> %lu  node free %lu -> %lu\n", node, cpu,
-             v, after, before, now);
-      drained += v > after ? v - after : 0;
+             before.cpu, after.cpu, before.free, after.free);
+      drained += before.cpu > after.cpu ? before.cpu - after.cpu : 0;
     }
   }
   return drained;
@@ -148,12 +146,11 @@ int main(void) {
   int i;
 
   for (i = 0; i < NGPU; i++) {
-    unsigned long sum, free_pages;
+    struct pcp s = pcp_counts(gpu_node[i], -1);
 
-    sum = pcp_counts(gpu_node[i], -1, &free_pages);
-    printf("node %2d  pcp %8lu pages (%lu MiB)  free %lu\n", gpu_node[i], sum,
-           sum << PAGE_SHIFT >> 20, free_pages);
-    total += sum;
+    printf("node %2d  pcp %8lu pages (%lu MiB)  free %lu\n", gpu_node[i],
+           s.total, s.total << PAGE_SHIFT >> 20, s.free);
+    total += s.total;
   }
   printf("parked total %lu pages (%lu MiB)\n\n", total,
          total << PAGE_SHIFT >> 20);
